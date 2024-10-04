@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,8 @@ use tui::backend::CrosstermBackend;
 use tui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
+    symbols,
+    widgets::{Axis, Block, Chart, Dataset, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -35,6 +37,9 @@ struct CPUMetrics {
     cpu_w: f64,
     gpu_w: f64,
     package_w: f64,
+    e_cluster_active_history: VecDeque<(Instant, i32)>,
+    p_cluster_active_history: VecDeque<(Instant, i32)>,
+    ane_w_history: VecDeque<(Instant, f64)>,
 }
 
 impl CPUMetrics {
@@ -48,7 +53,40 @@ impl CPUMetrics {
             cpu_w: 0.0,
             gpu_w: 0.0,
             package_w: 0.0,
+            e_cluster_active_history: VecDeque::new(),
+            p_cluster_active_history: VecDeque::new(),
+            ane_w_history: VecDeque::new(),
         }
+    }
+
+    fn append_e_cluster_active(&mut self, value: i32) {
+        let now = Instant::now();
+        self.e_cluster_active_history.push_back((now, value));
+        retain_recent(&mut self.e_cluster_active_history);
+    }
+
+    fn append_p_cluster_active(&mut self, value: i32) {
+        let now = Instant::now();
+        self.p_cluster_active_history.push_back((now, value));
+        retain_recent(&mut self.p_cluster_active_history);
+    }
+
+    fn append_ane_w(&mut self, value: f64) {
+        let now = Instant::now();
+        self.ane_w_history.push_back((now, value));
+        retain_recent(&mut self.ane_w_history);
+    }
+
+    fn average_e_cluster_active(&self) -> f64 {
+        average_history(&self.e_cluster_active_history)
+    }
+
+    fn average_p_cluster_active(&self) -> f64 {
+        average_history(&self.p_cluster_active_history)
+    }
+
+    fn average_ane_util(&self) -> f64 {
+        average_history(&self.ane_w_history)
     }
 }
 
@@ -83,6 +121,7 @@ impl NetDiskMetrics {
 struct GPUMetrics {
     freq_mhz: i32,
     active: f64,
+    active_history: VecDeque<(Instant, f64)>,
 }
 
 impl GPUMetrics {
@@ -90,7 +129,18 @@ impl GPUMetrics {
         Self {
             freq_mhz: 0,
             active: 0.0,
+            active_history: VecDeque::new(),
         }
+    }
+
+    fn append_active(&mut self, value: f64) {
+        let now = Instant::now();
+        self.active_history.push_back((now, value));
+        retain_recent(&mut self.active_history);
+    }
+
+    fn average_active(&self) -> f64 {
+        average_history(&self.active_history)
     }
 }
 
@@ -102,11 +152,27 @@ struct MemoryMetrics {
     swap_total: u64,
     swap_used: u64,
     used_percent: f32,
+    used_percent_history: VecDeque<(Instant, f64)>,
 }
 
 impl MemoryMetrics {
-    fn new() -> Self {
-        get_memory_metrics()
+    fn new(previous: &Option<MemoryMetrics>) -> Self {
+        let mut metrics = get_memory_metrics();
+        if let Some(prev) = previous {
+            metrics.used_percent_history = prev.used_percent_history.clone();
+        } else {
+            metrics.used_percent_history = VecDeque::new();
+        }
+        let now = Instant::now();
+        metrics
+            .used_percent_history
+            .push_back((now, metrics.used_percent as f64));
+        retain_recent(&mut metrics.used_percent_history);
+        metrics
+    }
+
+    fn average_used_percent(&self) -> f64 {
+        average_history(&self.used_percent_history)
     }
 }
 
@@ -157,9 +223,7 @@ lazy_static! {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!(
-            "welcome to mtop!"
-        );
+        eprintln!("This tool requires root privileges. Please run it with sudo.");
         std::process::exit(1);
     }
 
@@ -185,6 +249,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cpu_metrics = CPUMetrics::new();
     let mut gpu_metrics = GPUMetrics::new();
     let mut netdisk_metrics = NetDiskMetrics::new();
+    let mut memory_metrics = None;
 
     let model_info = get_apple_silicon_info();
 
@@ -218,7 +283,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if updated || need_render.should_notify() {
-            let memory_metrics = MemoryMetrics::new();
+            let mem_metrics = MemoryMetrics::new(&memory_metrics);
+            memory_metrics = Some(mem_metrics);
 
             // Render UI
             terminal.draw(|f| {
@@ -228,7 +294,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &gpu_metrics,
                     &netdisk_metrics,
                     &model_info,
-                    &memory_metrics,
+                    memory_metrics.as_ref().unwrap(),
                 )
             })?;
         }
@@ -325,78 +391,80 @@ fn draw_ui(
     // --- Top Half Widgets ---
 
     // Left Column - Top: E-CPU Usage
-    render_label_and_gauge(
+    let e_cpu_avg = cpu_metrics.average_e_cluster_active();
+    render_utilization_chart(
         f,
         left_top_bottom[0],
+        "E-CPU Usage",
         &format!(
-            "E-CPU Usage: {}% @ {}MHz",
-            cpu_metrics.e_cluster_active, cpu_metrics.e_cluster_freq_mhz
+            "{}% @ {}MHz\n Avg: {:.1}%",
+            cpu_metrics.e_cluster_active, cpu_metrics.e_cluster_freq_mhz, e_cpu_avg
         ),
-        cpu_metrics.e_cluster_active as u16,
+        &cpu_metrics.e_cluster_active_history,
         Color::Green,
     );
 
     // Left Column - Bottom: P-CPU Usage
-    render_label_and_gauge(
+    let p_cpu_avg = cpu_metrics.average_p_cluster_active();
+    render_utilization_chart(
         f,
         left_top_bottom[1],
+        "P-CPU Usage",
         &format!(
-            "P-CPU Usage: {}% @ {}MHz",
-            cpu_metrics.p_cluster_active, cpu_metrics.p_cluster_freq_mhz
+            "{}% @ {}MHz\n Avg: {:.1}%",
+            cpu_metrics.p_cluster_active, cpu_metrics.p_cluster_freq_mhz, p_cpu_avg
         ),
-        cpu_metrics.p_cluster_active as u16,
+        &cpu_metrics.p_cluster_active_history,
         Color::Yellow,
     );
 
     // Right Column - Top: GPU Usage
-    render_label_and_gauge(
+    let gpu_avg = gpu_metrics.average_active();
+    render_utilization_chart(
         f,
         right_top_bottom[0],
+        "GPU Usage",
         &format!(
-            "GPU Usage: {:.0}% @ {}MHz",
-            gpu_metrics.active, gpu_metrics.freq_mhz
+            "{:.0}% @ {}MHz\n Avg: {:.1}%",
+            gpu_metrics.active, gpu_metrics.freq_mhz, gpu_avg
         ),
-        gpu_metrics.active as u16,
+        &gpu_metrics.active_history,
         Color::Magenta,
     );
 
     // Right Column - Bottom: ANE Usage
-    let ane_util = (cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0); // Assuming 8W max ANE power
-    render_label_and_gauge(
+    let ane_util = (cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0); 
+    let ane_avg = cpu_metrics.average_ane_util();
+    render_utilization_chart(
         f,
         right_top_bottom[1],
+        "ANE Usage",
         &format!(
-            "ANE Usage: {:.0}% @ {:.2} W",
-            ane_util, cpu_metrics.ane_w
+            "{:.0}% @ {:.2}W\n Avg: {:.1}%",
+            ane_util, cpu_metrics.ane_w, ane_avg
         ),
-        ane_util as u16,
+        &cpu_metrics.ane_w_history,
         Color::Blue,
     );
 
     // --- Bottom Half Widgets ---
 
-    // Memory Usage: Block Title + Gauge
-    let memory_label = if memory_metrics.swap_total > 0 {
-        format!(
-            "Memory Usage: {:.2} GB / {:.2} GB (Swap Used: {:.2} GB / {:.2} GB)",
+    // Memory Usage: Line Chart
+    let mem_avg = memory_metrics.average_used_percent();
+    render_utilization_chart(
+        f,
+        bottom_vertical_chunks[0],
+        "Memory Usage",
+        &format!(
+            "{:.1}% \n \n {:.2} GB / {:.2} GB \n \n (Swap Used: {:.2} GB / {:.2} GB) \n \n Avg: {:.1}%",
+            memory_metrics.used_percent,
             (memory_metrics.used) as f64 / 1024.0 / 1024.0 / 1024.0,
             (memory_metrics.total) as f64 / 1024.0 / 1024.0 / 1024.0,
             (memory_metrics.swap_used) as f64 / 1024.0 / 1024.0 / 1024.0,
             (memory_metrics.swap_total) as f64 / 1024.0 / 1024.0 / 1024.0,
-        )
-    } else {
-        format!(
-            "Memory Usage: {:.2} GB / {:.2} GB (Swap Used: 0.00 GB / 0.00 GB)",
-            (memory_metrics.used) as f64 / 1024.0 / 1024.0 / 1024.0,
-            (memory_metrics.total) as f64 / 1024.0 / 1024.0 / 1024.0,
-        )
-    };
-
-    render_label_and_gauge(
-        f,
-        bottom_vertical_chunks[0],
-        &memory_label,
-        memory_metrics.used_percent as u16,
+            mem_avg,
+        ),
+        &memory_metrics.used_percent_history,
         Color::Cyan,
     );
 
@@ -414,7 +482,7 @@ fn draw_ui(
         .block(
             Block::default()
                 .title("Apple Silicon Info")
-                .borders(Borders::ALL),
+                .borders(tui::widgets::Borders::ALL),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(model_paragraph, bottom_chunks[0]);
@@ -438,7 +506,7 @@ fn draw_ui(
         .block(
             Block::default()
                 .title("Network & Disk Info")
-                .borders(Borders::ALL),
+                .borders(tui::widgets::Borders::ALL),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(netdisk_paragraph, bottom_chunks[1]);
@@ -455,38 +523,101 @@ fn draw_ui(
         cpu_metrics.package_w
     );
     let power_paragraph = Paragraph::new(power_text)
-        .block(Block::default().title("Power Usage").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Power Usage")
+                .borders(tui::widgets::Borders::ALL),
+        )
         .wrap(Wrap { trim: true });
     f.render_widget(power_paragraph, bottom_chunks[2]);
 }
 
-/// Renders a block title above a gauge within a given area.
-///
 /// # Arguments
 ///
 /// * `f` - The frame to render to.
 /// * `area` - The area allocated for this widget.
-/// * `label` - The text label to display as the block title.
-/// * `percent` - The percentage value to display inside the gauge.
-/// * `color` - The color of the gauge.
-fn render_label_and_gauge(
+/// * `title` - The title of the chart.
+/// * `label` - The label showing current utilization and frequency.
+/// * `history` - The historical data to plot.
+/// * `color` - The color of the line in the chart.
+fn render_utilization_chart<T>(
     f: &mut Frame<CrosstermBackend<std::io::Stdout>>,
     area: Rect,
+    title: &str,
     label: &str,
-    percent: u16,
+    history: &VecDeque<(Instant, T)>,
     color: Color,
-) {
-    // Render gauge with block title
-    let gauge = Gauge::default()
-        .block(
-            Block::default()
-                .title(label)
-                .borders(Borders::ALL),
+) where
+    T: Into<f64> + Copy,
+{
+    let now = Instant::now();
+    let data: Vec<(f64, f64)> = history
+        .iter()
+        .map(|(time, value)| {
+            let elapsed = now.duration_since(*time).as_secs_f64();
+            (-elapsed, (*value).into())
+        })
+        .collect();
+
+    let x_bounds = [-120.0, 0.0];
+
+    let dataset = Dataset::default()
+        .name(label)
+        .marker(symbols::Marker::Braille)
+        .style(Style::default().fg(color))
+        .graph_type(tui::widgets::GraphType::Line)
+        .data(&data);
+
+    let chart = Chart::new(vec![dataset])
+        .block(Block::default().title(format!("{}: {}", title, label)))
+        .x_axis(
+            Axis::default()
+                .bounds(x_bounds)
+                .style(Style::default())
+                .labels(vec![]),
         )
-        .gauge_style(Style::default().fg(color))
-        .percent(percent)
-        .label(format!("{}%", percent));
-    f.render_widget(gauge, area);
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .style(Style::default())
+                .labels(vec![]),
+        )
+        .style(Style::default())
+        .hidden_legend_constraints((Constraint::Ratio(0, 1), Constraint::Ratio(0, 1)));
+
+    f.render_widget(chart, area);
+}
+
+/// # Arguments
+///
+/// * `history` - The mutable reference to the historical data vector.
+fn retain_recent<T>(history: &mut VecDeque<(Instant, T)>) {
+    let cutoff = Instant::now() - Duration::from_secs(120);
+    while let Some(&(time, _)) = history.front() {
+        if time < cutoff {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// # Arguments
+///
+/// * `history` - The historical data vector.
+///
+/// # Returns
+///
+/// The average value as a `f64`.
+fn average_history<T>(history: &VecDeque<(Instant, T)>) -> f64
+where
+    T: Into<f64> + Copy,
+{
+    if history.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = history.iter().map(|&(_, value)| value.into()).sum();
+    sum / (history.len() as f64)
 }
 
 fn collect_metrics(
@@ -529,6 +660,12 @@ fn collect_metrics(
         parse_gpu_metrics(&line, &mut gpu_metrics);
         parse_netdisk_metrics(&line, &mut netdisk_metrics);
 
+        cpu_metrics.append_e_cluster_active(cpu_metrics.e_cluster_active);
+        cpu_metrics.append_p_cluster_active(cpu_metrics.p_cluster_active);
+        cpu_metrics.append_ane_w((cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0));
+
+        gpu_metrics.append_active(gpu_metrics.active);
+
         let _ = cpu_tx.send(cpu_metrics.clone());
         let _ = gpu_tx.send(gpu_metrics.clone());
         let _ = netdisk_tx.send(netdisk_metrics.clone());
@@ -559,20 +696,17 @@ fn parse_cpu_metrics(line: &str, cpu_metrics: &mut CPUMetrics) {
     if line.contains("ANE Power") {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3 {
-            cpu_metrics.ane_w =
-                parts[2].trim_end_matches("mW").parse().unwrap_or(0.0) / 1000.0;
+            cpu_metrics.ane_w = parts[2].trim_end_matches("mW").parse().unwrap_or(0.0) / 1000.0;
         }
     } else if line.contains("CPU Power") {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3 {
-            cpu_metrics.cpu_w =
-                parts[2].trim_end_matches("mW").parse().unwrap_or(0.0) / 1000.0;
+            cpu_metrics.cpu_w = parts[2].trim_end_matches("mW").parse().unwrap_or(0.0) / 1000.0;
         }
     } else if line.contains("GPU Power") {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3 {
-            cpu_metrics.gpu_w =
-                parts[2].trim_end_matches("mW").parse().unwrap_or(0.0) / 1000.0;
+            cpu_metrics.gpu_w = parts[2].trim_end_matches("mW").parse().unwrap_or(0.0) / 1000.0;
         }
     } else if line.contains("Combined Power (CPU + GPU + ANE)") {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -639,6 +773,7 @@ fn get_memory_metrics() -> MemoryMetrics {
                 swap_total: 0,
                 swap_used: 0,
                 used_percent: 0.0,
+                used_percent_history: VecDeque::new(),
             };
         }
 
@@ -661,6 +796,7 @@ fn get_memory_metrics() -> MemoryMetrics {
                     swap_total: 0,
                     swap_used: 0,
                     used_percent: 0.0,
+                    used_percent_history: VecDeque::new(),
                 }
             }
         };
@@ -690,6 +826,7 @@ fn get_memory_metrics() -> MemoryMetrics {
             swap_total,
             swap_used,
             used_percent: used_percent as f32,
+            used_percent_history: VecDeque::new(),
         }
     }
 }
@@ -822,3 +959,4 @@ fn get_gpu_core_count() -> Result<String, std::io::Error> {
         "Failed to get GPU core count",
     ))
 }
+
