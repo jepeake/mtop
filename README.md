@@ -4,7 +4,8 @@ _**mtop** is a terminal-based performance monitor for Apple Silicon._
 
 _Written in <1k Lines of Rust._
 
-![image](https://github.com/user-attachments/assets/f7a271a8-80a0-4634-b934-a94cece24900)
+![image](https://github.com/user-attachments/assets/b46233df-f051-46ce-8d45-8f23f293f83d)
+
 
 ### _Features_
 
