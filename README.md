@@ -1,5 +1,7 @@
 # _mtop_
 
+[![Rust](https://img.shields.io/badge/Rust-%23000000.svg?e&logo=rust&logoColor=white)](#) &ensp; ![GitHub Release](https://img.shields.io/github/v/release/jepeake/mtop) 
+
 _**mtop** is a terminal-based performance monitor for Apple Silicon._
 
 _It provides a powerful & efficient way to monitor utilisation of CPU (P & E-Cores), GPU, ANE, Memory - and other system metrics._
