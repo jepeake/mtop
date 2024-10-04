@@ -21,19 +21,13 @@ _Written in < 1k Lines of Rust._
 
 ## _Installation_
 
-1. _Install Rust (if not already installed):_
+_Install using [Homebrew](https://brew.sh):_
 
-```curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh```
+```brew tap jepeake/mtop && brew install mtop```
 
-2. _Clone the **mtop** repo:_
+_Run:_
 
-```git clone https://github.com/jepeake/mtop && cd mtop```
-
-3. _Build & Run the application using cargo:_
-
-```sudo cargo build && sudo cargo run```
-
-
+```sudo mtop```
 
 ## _Acknowledgements_
 
