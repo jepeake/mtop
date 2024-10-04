@@ -22,6 +22,10 @@ use tui::{
     Frame, Terminal,
 };
 
+use tui::widgets::canvas;
+use tui::widgets::canvas::Canvas;
+use tui::widgets::canvas::Line;
+
 use libc::{
     c_int, host_info64_t, host_statistics64, mach_host_self, mach_msg_type_number_t, natural_t,
     vm_statistics64_data_t, HOST_VM_INFO64,
@@ -395,9 +399,9 @@ fn draw_ui(
     render_utilization_chart(
         f,
         left_top_bottom[0],
-        "E-CPU Usage",
+        "\n E-CPU Usage",
         &format!(
-            "{}% @ {}MHz\n Avg: {:.1}%",
+            "{}% @ {}MHz\n \n \n Avg: {:.1}% \n",
             cpu_metrics.e_cluster_active, cpu_metrics.e_cluster_freq_mhz, e_cpu_avg
         ),
         &cpu_metrics.e_cluster_active_history,
@@ -411,7 +415,7 @@ fn draw_ui(
         left_top_bottom[1],
         "P-CPU Usage",
         &format!(
-            "{}% @ {}MHz\n Avg: {:.1}%",
+            "{}% @ {}MHz\n Avg: {:.1}% \n",
             cpu_metrics.p_cluster_active, cpu_metrics.p_cluster_freq_mhz, p_cpu_avg
         ),
         &cpu_metrics.p_cluster_active_history,
@@ -423,9 +427,9 @@ fn draw_ui(
     render_utilization_chart(
         f,
         right_top_bottom[0],
-        "GPU Usage",
+        "\n GPU Usage",
         &format!(
-            "{:.0}% @ {}MHz\n Avg: {:.1}%",
+            "{:.0}% @ {}MHz\n \n \n Avg: {:.1}% \n",
             gpu_metrics.active, gpu_metrics.freq_mhz, gpu_avg
         ),
         &gpu_metrics.active_history,
@@ -438,9 +442,9 @@ fn draw_ui(
     render_utilization_chart(
         f,
         right_top_bottom[1],
-        "ANE Usage",
+        "\n ANE Usage",
         &format!(
-            "{:.0}% @ {:.2}W\n Avg: {:.1}%",
+            "{:.0}% @ {:.2}W\n \n \n Avg: {:.1}% \n",
             ane_util, cpu_metrics.ane_w, ane_avg
         ),
         &cpu_metrics.ane_w_history,
@@ -454,9 +458,9 @@ fn draw_ui(
     render_utilization_chart(
         f,
         bottom_vertical_chunks[0],
-        "Memory Usage",
+        "\n Memory Usage",
         &format!(
-            "{:.1}% \n \n {:.2} GB / {:.2} GB \n \n (Swap Used: {:.2} GB / {:.2} GB) \n \n Avg: {:.1}%",
+            "{:.1}% \n \n {:.2} GB / {:.2} GB \n \n (Swap Used: {:.2} GB / {:.2} GB) \n \n Avg: {:.1}% \n",
             memory_metrics.used_percent,
             (memory_metrics.used) as f64 / 1024.0 / 1024.0 / 1024.0,
             (memory_metrics.total) as f64 / 1024.0 / 1024.0 / 1024.0,
@@ -539,7 +543,7 @@ fn draw_ui(
 /// * `title` - The title of the chart.
 /// * `label` - The label showing current utilization and frequency.
 /// * `history` - The historical data to plot.
-/// * `color` - The color of the line in the chart.
+/// * `color` - The color of the filled area under the line graph.
 fn render_utilization_chart<T>(
     f: &mut Frame<CrosstermBackend<std::io::Stdout>>,
     area: Rect,
@@ -560,32 +564,41 @@ fn render_utilization_chart<T>(
         .collect();
 
     let x_bounds = [-120.0, 0.0];
+    let y_bounds = [0.0, 100.0];
 
-    let dataset = Dataset::default()
-        .name(label)
-        .marker(symbols::Marker::Braille)
-        .style(Style::default().fg(color))
-        .graph_type(tui::widgets::GraphType::Line)
-        .data(&data);
-
-    let chart = Chart::new(vec![dataset])
-        .block(Block::default().title(format!("{}: {}", title, label)))
-        .x_axis(
-            Axis::default()
-                .bounds(x_bounds)
-                .style(Style::default())
-                .labels(vec![]),
+    let canvas = Canvas::default()
+        .block(
+            Block::default()
+                .title(format!("{}: {}", title, label))
+                .borders(tui::widgets::Borders::ALL),
         )
-        .y_axis(
-            Axis::default()
-                .bounds([0.0, 100.0])
-                .style(Style::default())
-                .labels(vec![]),
-        )
-        .style(Style::default())
-        .hidden_legend_constraints((Constraint::Ratio(0, 1), Constraint::Ratio(0, 1)));
+        .x_bounds(x_bounds)
+        .y_bounds(y_bounds)
+        .paint(move |ctx| {
+            for &(x, y) in &data {
+                ctx.draw(&Line {
+                    x1: x,
+                    y1: 0.0,
+                    x2: x,
+                    y2: y,
+                    color,
+                });
+            }
 
-    f.render_widget(chart, area);
+            for window in data.windows(2) {
+                if let [start, end] = window {
+                    ctx.draw(&Line {
+                        x1: start.0,
+                        y1: start.1,
+                        x2: end.0,
+                        y2: end.1,
+                        color: Color::White,
+                    });
+                }
+            }
+        });
+
+    f.render_widget(canvas, area);
 }
 
 /// # Arguments
@@ -959,4 +972,3 @@ fn get_gpu_core_count() -> Result<String, std::io::Error> {
         "Failed to get GPU core count",
     ))
 }
-
