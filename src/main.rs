@@ -1,3 +1,4 @@
+
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -8,20 +9,24 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{unbounded, Sender};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use lazy_static::lazy_static;
 use regex::Regex;
 use tui::backend::CrosstermBackend;
 use tui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color},
+    style::Color,
     widgets::{Block, Paragraph, Wrap},
     widgets::canvas::{Canvas, Line},
-    Frame, Terminal};
+    Frame, Terminal,
+};
 
 use libc::{
     c_int, host_info64_t, host_statistics64, mach_host_self, mach_msg_type_number_t, natural_t,
-    vm_statistics64_data_t, HOST_VM_INFO64};
+    vm_statistics64_data_t, HOST_VM_INFO64,
+};
 
 #[derive(Clone)]
 struct CPUMetrics {
@@ -36,6 +41,9 @@ struct CPUMetrics {
     e_cluster_active_history: VecDeque<(Instant, i32)>,
     p_cluster_active_history: VecDeque<(Instant, i32)>,
     ane_w_history: VecDeque<(Instant, f64)>,
+    cpu_w_history: VecDeque<(Instant, f64)>,
+    gpu_w_history: VecDeque<(Instant, f64)>,
+    package_w_history: VecDeque<(Instant, f64)>,
 }
 
 impl CPUMetrics {
@@ -52,6 +60,9 @@ impl CPUMetrics {
             e_cluster_active_history: VecDeque::new(),
             p_cluster_active_history: VecDeque::new(),
             ane_w_history: VecDeque::new(),
+            cpu_w_history: VecDeque::new(),
+            gpu_w_history: VecDeque::new(),
+            package_w_history: VecDeque::new(),
         }
     }
 
@@ -73,6 +84,24 @@ impl CPUMetrics {
         retain_recent(&mut self.ane_w_history);
     }
 
+    fn append_cpu_w(&mut self, value: f64) {
+        let now = Instant::now();
+        self.cpu_w_history.push_back((now, value));
+        retain_recent(&mut self.cpu_w_history);
+    }
+
+    fn append_gpu_w(&mut self, value: f64) {
+        let now = Instant::now();
+        self.gpu_w_history.push_back((now, value));
+        retain_recent(&mut self.gpu_w_history);
+    }
+
+    fn append_package_w(&mut self, value: f64) {
+        let now = Instant::now();
+        self.package_w_history.push_back((now, value));
+        retain_recent(&mut self.package_w_history);
+    }
+
     fn average_e_cluster_active(&self) -> f64 {
         average_history(&self.e_cluster_active_history)
     }
@@ -83,6 +112,18 @@ impl CPUMetrics {
 
     fn average_ane_util(&self) -> f64 {
         average_history(&self.ane_w_history)
+    }
+
+    fn average_cpu_w(&self) -> f64 {
+        average_history(&self.cpu_w_history)
+    }
+
+    fn average_gpu_w(&self) -> f64 {
+        average_history(&self.gpu_w_history)
+    }
+
+    fn average_package_w(&self) -> f64 {
+        average_history(&self.package_w_history)
     }
 }
 
@@ -314,80 +355,58 @@ fn draw_ui(
 ) {
     let size = f.size();
 
+    // Split the screen vertically into top and bottom halves
     let vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage(50), 
-                Constraint::Percentage(50), 
+                Constraint::Percentage(50), // Top Half
+                Constraint::Percentage(50), // Bottom Half
             ]
             .as_ref(),
         )
         .split(size);
 
+    // --- Top Half (CPU/GPU/ANE Utilization + Power) ---
     let top_columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(
             [
-                Constraint::Percentage(50), 
-                Constraint::Percentage(50), 
+                Constraint::Percentage(50), // Left Column (CPU)
+                Constraint::Percentage(50), // Right Column (GPU & ANE)
             ]
             .as_ref(),
         )
         .split(vertical_chunks[0]);
 
-    let left_top_bottom = Layout::default()
+    // Left Column: CPU Utilization and CPU Power
+    let left_split = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage(50), 
-                Constraint::Percentage(50), 
+                Constraint::Percentage(80), // CPU Utilization
+                Constraint::Percentage(20), // CPU Power
             ]
             .as_ref(),
         )
         .split(top_columns[0]);
 
-    let right_top_bottom = Layout::default()
+    // CPU Utilization (E-CPU and P-CPU)
+    let cpu_utilization_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage(50), 
-                Constraint::Percentage(50), 
+                Constraint::Percentage(50), // E-CPU
+                Constraint::Percentage(50), // P-CPU
             ]
             .as_ref(),
         )
-        .split(top_columns[1]);
+        .split(left_split[0]);
 
-    let bottom_vertical_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(50), 
-                Constraint::Percentage(50), 
-            ]
-            .as_ref(),
-        )
-        .split(vertical_chunks[1]);
-
-    let bottom_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-            ]
-            .as_ref(),
-        )
-        .split(bottom_vertical_chunks[1]);
-
-    // --- Top Half Widgets ---
-
-    // Left Column - Top: E-CPU Usage
     let e_cpu_avg = cpu_metrics.average_e_cluster_active();
     render_utilization_chart(
         f,
-        left_top_bottom[0],
+        cpu_utilization_chunks[0],
         "\n E-CPU Usage",
         &format!(
             "{}% @ {}MHz\n \n \n Avg: {:.1}% \n",
@@ -397,40 +416,58 @@ fn draw_ui(
         Color::Green,
     );
 
-    // Left Column - Bottom: P-CPU Usage
     let p_cpu_avg = cpu_metrics.average_p_cluster_active();
     render_utilization_chart(
         f,
-        left_top_bottom[1],
-        "P-CPU Usage",
+        cpu_utilization_chunks[1],
+        "\n P-CPU Usage",
         &format!(
-            "{}% @ {}MHz\n Avg: {:.1}% \n",
+            "{}% @ {}MHz\n \n \n Avg: {:.1}% \n",
             cpu_metrics.p_cluster_active, cpu_metrics.p_cluster_freq_mhz, p_cpu_avg
         ),
         &cpu_metrics.p_cluster_active_history,
         Color::Yellow,
     );
 
-    // Right Column - Top: GPU Usage
-    let gpu_avg = gpu_metrics.average_active();
-    render_utilization_chart(
+    // CPU Power
+    render_power_chart(
         f,
-        right_top_bottom[0],
-        "\n GPU Usage",
-        &format!(
-            "{:.0}% @ {}MHz\n \n \n Avg: {:.1}% \n",
-            gpu_metrics.active, gpu_metrics.freq_mhz, gpu_avg
-        ),
-        &gpu_metrics.active_history,
-        Color::Magenta,
+        left_split[1],
+        "\n CPU Power",
+        &format!("{:.2} W \n", cpu_metrics.cpu_w),
+        &cpu_metrics.cpu_w_history,
+        Color::Red,
     );
 
-    // Right Column - Bottom: ANE Usage
-    let ane_util = (cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0); 
+    // Right Column: GPU & ANE Utilization and GPU Power
+    let right_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage(80), // GPU & ANE Utilization
+                Constraint::Percentage(20), // GPU Power
+            ]
+            .as_ref(),
+        )
+        .split(top_columns[1]);
+
+    // GPU & ANE Utilization
+    let gpu_ane_utilization_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage(50), // GPU
+                Constraint::Percentage(50), // ANE
+            ]
+            .as_ref(),
+        )
+        .split(right_split[0]);
+
+    let ane_util = (cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0);
     let ane_avg = cpu_metrics.average_ane_util();
     render_utilization_chart(
         f,
-        right_top_bottom[1],
+        gpu_ane_utilization_chunks[0],
         "\n ANE Usage",
         &format!(
             "{:.0}% @ {:.2}W\n \n \n Avg: {:.1}% \n",
@@ -440,15 +477,48 @@ fn draw_ui(
         Color::Blue,
     );
 
-    // --- Third Quarter Widgets ---
+    let gpu_avg = gpu_metrics.average_active();
+    render_utilization_chart(
+        f,
+        gpu_ane_utilization_chunks[1],
+        "\n GPU Usage",
+        &format!(
+            "{:.0}% @ {}MHz\n \n \n Avg: {:.1}% \n",
+            gpu_metrics.active, gpu_metrics.freq_mhz, gpu_avg
+        ),
+        &gpu_metrics.active_history,
+        Color::Magenta,
+    );
+    // GPU Power
+    render_power_chart(
+        f,
+        right_split[1],
+        "\n GPU Power",
+        &format!("{:.2} W \n", cpu_metrics.gpu_w),
+        &cpu_metrics.gpu_w_history,
+        Color::Red,
+    );
 
+    // --- Bottom Half ---
+    let bottom_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(
+            [
+                Constraint::Percentage(50), // Memory Usage
+                Constraint::Percentage(50), // Apple Silicon Info, Network & Disk Info, Package Power
+            ]
+            .as_ref(),
+        )
+        .split(vertical_chunks[1]);
+
+    // Memory Usage spanning the top half of the bottom half
     let mem_avg = memory_metrics.average_used_percent();
     render_utilization_chart(
         f,
-        bottom_vertical_chunks[0],
+        bottom_split[0],
         "\n Memory Usage",
         &format!(
-            "{:.1}% \n \n {:.2} GB / {:.2} GB \n \n (Swap Used: {:.2} GB / {:.2} GB) \n \n Avg: {:.1}% \n",
+            "{:.1}%\n \n \n {:.2} GB / {:.2} GB\n \n \n Swap Used: {:.2} GB / {:.2} GB\n \n \n Avg: {:.1}% \n",
             memory_metrics.used_percent,
             (memory_metrics.used) as f64 / 1024.0 / 1024.0 / 1024.0,
             (memory_metrics.total) as f64 / 1024.0 / 1024.0 / 1024.0,
@@ -460,8 +530,20 @@ fn draw_ui(
         Color::Cyan,
     );
 
-    // --- Bottom Quarter Widgets ---
+    // Bottom part of the bottom half: Apple Silicon Info, Network & Disk Info, Package Power
+    let lower_bottom_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            [
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ]
+            .as_ref(),
+        )
+        .split(bottom_split[1]);
 
+    // Apple Silicon Info
     let model_text = format!(
         "Model: {}\nE-Cores: {}\nP-Cores: {}\nGPU Cores: {}",
         model_info.name,
@@ -472,12 +554,13 @@ fn draw_ui(
     let model_paragraph = Paragraph::new(model_text)
         .block(
             Block::default()
-                .title("Apple Silicon Info")
+                .title("\n Apple Silicon Info \n")
                 .borders(tui::widgets::Borders::ALL),
         )
         .wrap(Wrap { trim: true });
-    f.render_widget(model_paragraph, bottom_chunks[0]);
+    f.render_widget(model_paragraph, lower_bottom_chunks[0]);
 
+    // Network & Disk Info
     let netdisk_text = format!(
         "Out: {:.1} packets/s, {:.1} bytes/s\n\
         In: {:.1} packets/s, {:.1} bytes/s\n\
@@ -495,30 +578,21 @@ fn draw_ui(
     let netdisk_paragraph = Paragraph::new(netdisk_text)
         .block(
             Block::default()
-                .title("Network & Disk Info")
+                .title("\n Network & Disk Info \n")
                 .borders(tui::widgets::Borders::ALL),
         )
         .wrap(Wrap { trim: true });
-    f.render_widget(netdisk_paragraph, bottom_chunks[1]);
+    f.render_widget(netdisk_paragraph, lower_bottom_chunks[1]);
 
-    let power_text = format!(
-        "CPU Power: {:.2} W\n\
-        GPU Power: {:.2} W\n\
-        ANE Power: {:.2} W\n\
-        Total Power: {:.2} W",
-        cpu_metrics.cpu_w,
-        cpu_metrics.gpu_w,
-        cpu_metrics.ane_w,
-        cpu_metrics.package_w
+    // Package Power
+    render_power_chart(
+        f,
+        lower_bottom_chunks[2],
+        "\n Package Power",
+        &format!("{:.2} W \n", cpu_metrics.package_w),
+        &cpu_metrics.package_w_history,
+        Color::Red,
     );
-    let power_paragraph = Paragraph::new(power_text)
-        .block(
-            Block::default()
-                .title("Power Usage")
-                .borders(tui::widgets::Borders::ALL),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(power_paragraph, bottom_chunks[2]);
 }
 
 fn render_utilization_chart<T>(
@@ -537,6 +611,71 @@ fn render_utilization_chart<T>(
         .map(|(time, value)| {
             let elapsed = now.duration_since(*time).as_secs_f64();
             (-elapsed, (*value).into())
+        })
+        .collect();
+
+    let x_bounds = [-120.0, 0.0];
+    let y_bounds = [0.0, 100.0];
+
+    let canvas = Canvas::default()
+        .block(
+            Block::default()
+                .title(format!("{}: {}", title, label))
+                .borders(tui::widgets::Borders::ALL),
+        )
+        .x_bounds(x_bounds)
+        .y_bounds(y_bounds)
+        .paint(move |ctx| {
+            for &(x, y) in &data {
+                ctx.draw(&Line {
+                    x1: x,
+                    y1: 0.0,
+                    x2: x,
+                    y2: y,
+                    color,
+                });
+            }
+
+            for window in data.windows(2) {
+                if let [start, end] = window {
+                    ctx.draw(&Line {
+                        x1: start.0,
+                        y1: start.1,
+                        x2: end.0,
+                        y2: end.1,
+                        color: Color::White,
+                    });
+                }
+            }
+        });
+
+    f.render_widget(canvas, area);
+}
+
+fn render_power_chart(
+    f: &mut Frame<CrosstermBackend<std::io::Stdout>>,
+    area: Rect,
+    title: &str,
+    label: &str,
+    history: &VecDeque<(Instant, f64)>,
+    color: Color,
+) {
+    let now = Instant::now();
+    // Find the peak in the last 120 seconds
+    let peak = history
+        .iter()
+        .filter(|(time, _)| *time >= now - Duration::from_secs(120))
+        .map(|(_, value)| value)
+        .fold(0.0f64, |a, &b| a.max(b));
+    if peak == 0.0 {
+        return;
+    }
+    // Collect data as proportion of peak
+    let data: Vec<(f64, f64)> = history
+        .iter()
+        .map(|(time, value)| {
+            let elapsed = now.duration_since(*time).as_secs_f64();
+            (-elapsed, (value / peak) * 100.0)
         })
         .collect();
 
@@ -640,9 +779,14 @@ fn collect_metrics(
         parse_gpu_metrics(&line, &mut gpu_metrics);
         parse_netdisk_metrics(&line, &mut netdisk_metrics);
 
+        // Append to histories
         cpu_metrics.append_e_cluster_active(cpu_metrics.e_cluster_active);
         cpu_metrics.append_p_cluster_active(cpu_metrics.p_cluster_active);
         cpu_metrics.append_ane_w((cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0));
+
+        cpu_metrics.append_cpu_w(cpu_metrics.cpu_w);
+        cpu_metrics.append_gpu_w(cpu_metrics.gpu_w);
+        cpu_metrics.append_package_w(cpu_metrics.package_w);
 
         gpu_metrics.append_active(gpu_metrics.active);
 

@@ -8,14 +8,14 @@ _It provides a powerful & efficient way to monitor utilisation of CPU (P & E-Cor
 
 _Written in < 1k Lines of Rust._
 
-![image](https://github.com/user-attachments/assets/b46233df-f051-46ce-8d45-8f23f293f83d)
-
+![image](https://github.com/user-attachments/assets/623a9955-37a7-40ba-970a-48815f76e3d9)
 
 ## _Features_
 
 - _CPU (P & E-Core), GPU, ANE, & Memory Utilisation_
-- _Network & Disk Information_
 - _Power Information_
+- _Network & Disk Information_
+- _Apple Silicon Info_
 - _Intuituve UI_
 - _High Performance_
 
