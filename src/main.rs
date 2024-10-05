@@ -8,28 +8,20 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{unbounded, Sender};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use lazy_static::lazy_static;
 use regex::Regex;
 use tui::backend::CrosstermBackend;
 use tui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    symbols,
-    widgets::{Axis, Block, Chart, Dataset, Paragraph, Wrap},
-    Frame, Terminal,
-};
-
-use tui::widgets::canvas;
-use tui::widgets::canvas::Canvas;
-use tui::widgets::canvas::Line;
+    style::{Color},
+    widgets::{Block, Paragraph, Wrap},
+    widgets::canvas::{Canvas, Line},
+    Frame, Terminal};
 
 use libc::{
     c_int, host_info64_t, host_statistics64, mach_host_self, mach_msg_type_number_t, natural_t,
-    vm_statistics64_data_t, HOST_VM_INFO64,
-};
+    vm_statistics64_data_t, HOST_VM_INFO64};
 
 #[derive(Clone)]
 struct CPUMetrics {
@@ -151,8 +143,6 @@ impl GPUMetrics {
 struct MemoryMetrics {
     total: u64,
     used: u64,
-    available: u64,
-    free: u64,
     swap_total: u64,
     swap_used: u64,
     used_percent: f32,
@@ -290,7 +280,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mem_metrics = MemoryMetrics::new(&memory_metrics);
             memory_metrics = Some(mem_metrics);
 
-            // Render UI
             terminal.draw(|f| {
                 draw_ui(
                     f,
@@ -329,8 +318,8 @@ fn draw_ui(
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage(50), // Top Half
-                Constraint::Percentage(50), // Bottom Half
+                Constraint::Percentage(50), 
+                Constraint::Percentage(50), 
             ]
             .as_ref(),
         )
@@ -340,8 +329,8 @@ fn draw_ui(
         .direction(Direction::Horizontal)
         .constraints(
             [
-                Constraint::Percentage(50), // Left Column
-                Constraint::Percentage(50), // Right Column
+                Constraint::Percentage(50), 
+                Constraint::Percentage(50), 
             ]
             .as_ref(),
         )
@@ -351,8 +340,8 @@ fn draw_ui(
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage(50), // Top Block
-                Constraint::Percentage(50), // Bottom Block
+                Constraint::Percentage(50), 
+                Constraint::Percentage(50), 
             ]
             .as_ref(),
         )
@@ -362,8 +351,8 @@ fn draw_ui(
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage(50), // Top Block
-                Constraint::Percentage(50), // Bottom Block
+                Constraint::Percentage(50), 
+                Constraint::Percentage(50), 
             ]
             .as_ref(),
         )
@@ -373,8 +362,8 @@ fn draw_ui(
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage(50), // Memory Usage
-                Constraint::Percentage(50), // Other Info
+                Constraint::Percentage(50), 
+                Constraint::Percentage(50), 
             ]
             .as_ref(),
         )
@@ -451,9 +440,8 @@ fn draw_ui(
         Color::Blue,
     );
 
-    // --- Bottom Half Widgets ---
+    // --- Third Quarter Widgets ---
 
-    // Memory Usage: Line Chart
     let mem_avg = memory_metrics.average_used_percent();
     render_utilization_chart(
         f,
@@ -472,9 +460,8 @@ fn draw_ui(
         Color::Cyan,
     );
 
-    // --- Bottom Bottom Half Widgets ---
+    // --- Bottom Quarter Widgets ---
 
-    // Apple Silicon Info
     let model_text = format!(
         "Model: {}\nE-Cores: {}\nP-Cores: {}\nGPU Cores: {}",
         model_info.name,
@@ -491,7 +478,6 @@ fn draw_ui(
         .wrap(Wrap { trim: true });
     f.render_widget(model_paragraph, bottom_chunks[0]);
 
-    // Network & Disk Info
     let netdisk_text = format!(
         "Out: {:.1} packets/s, {:.1} bytes/s\n\
         In: {:.1} packets/s, {:.1} bytes/s\n\
@@ -515,7 +501,6 @@ fn draw_ui(
         .wrap(Wrap { trim: true });
     f.render_widget(netdisk_paragraph, bottom_chunks[1]);
 
-    // Power Information
     let power_text = format!(
         "CPU Power: {:.2} W\n\
         GPU Power: {:.2} W\n\
@@ -536,14 +521,6 @@ fn draw_ui(
     f.render_widget(power_paragraph, bottom_chunks[2]);
 }
 
-/// # Arguments
-///
-/// * `f` - The frame to render to.
-/// * `area` - The area allocated for this widget.
-/// * `title` - The title of the chart.
-/// * `label` - The label showing current utilization and frequency.
-/// * `history` - The historical data to plot.
-/// * `color` - The color of the filled area under the line graph.
 fn render_utilization_chart<T>(
     f: &mut Frame<CrosstermBackend<std::io::Stdout>>,
     area: Rect,
@@ -601,9 +578,6 @@ fn render_utilization_chart<T>(
     f.render_widget(canvas, area);
 }
 
-/// # Arguments
-///
-/// * `history` - The mutable reference to the historical data vector.
 fn retain_recent<T>(history: &mut VecDeque<(Instant, T)>) {
     let cutoff = Instant::now() - Duration::from_secs(120);
     while let Some(&(time, _)) = history.front() {
@@ -615,13 +589,6 @@ fn retain_recent<T>(history: &mut VecDeque<(Instant, T)>) {
     }
 }
 
-/// # Arguments
-///
-/// * `history` - The historical data vector.
-///
-/// # Returns
-///
-/// The average value as a `f64`.
 fn average_history<T>(history: &VecDeque<(Instant, T)>) -> f64
 where
     T: Into<f64> + Copy,
@@ -781,8 +748,6 @@ fn get_memory_metrics() -> MemoryMetrics {
             return MemoryMetrics {
                 total: 0,
                 used: 0,
-                available: 0,
-                free: 0,
                 swap_total: 0,
                 swap_used: 0,
                 used_percent: 0.0,
@@ -792,9 +757,7 @@ fn get_memory_metrics() -> MemoryMetrics {
 
         let page_size = libc::sysconf(libc::_SC_PAGESIZE) as u64;
 
-        let free = vm_info.free_count as u64 * page_size;
         let active = vm_info.active_count as u64 * page_size;
-        let inactive = vm_info.inactive_count as u64 * page_size;
         let wired = vm_info.wire_count as u64 * page_size;
         let compressed = vm_info.compressor_page_count as u64 * page_size;
 
@@ -804,8 +767,6 @@ fn get_memory_metrics() -> MemoryMetrics {
                 return MemoryMetrics {
                     total: 0,
                     used: 0,
-                    available: 0,
-                    free: 0,
                     swap_total: 0,
                     swap_used: 0,
                     used_percent: 0.0,
@@ -815,7 +776,6 @@ fn get_memory_metrics() -> MemoryMetrics {
         };
 
         let used = active + wired + compressed;
-        let available = free + inactive;
 
         let (swap_total, swap_used, _) = match get_swap_memory() {
             Ok((t, u, f)) => (t, u, f),
@@ -834,8 +794,6 @@ fn get_memory_metrics() -> MemoryMetrics {
         MemoryMetrics {
             total: total_with_swap,
             used: used_with_swap,
-            available,
-            free,
             swap_total,
             swap_used,
             used_percent: used_percent as f32,
