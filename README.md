@@ -4,11 +4,12 @@
 
 _**mtop** is a terminal-based performance monitor for Apple Silicon._
 
-_It provides an efficient way to monitor utilisation & power consumption of the CPU (P & E-Cores), GPU, ANE, Memory - and other system metrics straight from the terminal._
+_It provides an efficient way to monitor utilisation & power consumption of the CPU (P & E-Cores), GPU, ANE, Memory, and other system metrics straight from the terminal._
 
 _Written in ~1000 Lines of Rust._
 
-![image](https://github.com/user-attachments/assets/2ab31ab3-69f9-4311-b0af-98a192968533)
+![image](https://github.com/user-attachments/assets/9ebf92b0-b025-4bb4-909f-97007bce8a83)
+
 
 ## _Features_
 
@@ -16,6 +17,7 @@ _Written in ~1000 Lines of Rust._
 - _Power Information_
 - _Network & Disk Information_
 - _Apple Silicon Info_
+- _Time-Series Graphs_
 - _Intuituve UI_
 - _High Performance_
 
