@@ -8,8 +8,7 @@ _It provides an efficient way to monitor utilisation & power consumption of the 
 
 _Written in ~1000 Lines of Rust._
 
-![image](https://github.com/user-attachments/assets/9ebf92b0-b025-4bb4-909f-97007bce8a83)
-
+![image](https://github.com/user-attachments/assets/b3dfbcf2-c43e-4cac-adf9-90fea1113fcd)
 
 ## _Features_
 
