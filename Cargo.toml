@@ -12,3 +12,6 @@ regex = "1.7"
 lazy_static = "1.4"
 crossbeam-channel = "0.5"
 libc = "0.2"
+libproc = "0.14"
+num_cpus = "1.16"
+

@@ -1,10 +1,18 @@
-
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::cmp::Ordering;
+
+use std::convert::TryInto;
+
+use libproc::libproc::pid_rusage::{self, RUsageInfoV4};
+use libproc::libproc::proc_pid::{self, pidinfo};
+use libproc::libproc::task_info::TaskInfo;
+
+use libc::{c_void, clock_gettime, timespec, CLOCK_MONOTONIC};
 
 use crossbeam_channel::{unbounded, Sender};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
@@ -17,8 +25,8 @@ use regex::Regex;
 use tui::backend::CrosstermBackend;
 use tui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Color,
-    widgets::{Block, Paragraph, Wrap},
+    style::{Color, Style, Modifier},
+    widgets::{Block, Paragraph, Wrap, Table, Row},
     widgets::canvas::{Canvas, Line},
     Frame, Terminal,
 };
@@ -128,33 +136,6 @@ impl CPUMetrics {
 }
 
 #[derive(Clone)]
-struct NetDiskMetrics {
-    out_packets_per_sec: f64,
-    out_bytes_per_sec: f64,
-    in_packets_per_sec: f64,
-    in_bytes_per_sec: f64,
-    read_ops_per_sec: f64,
-    write_ops_per_sec: f64,
-    read_kbytes_per_sec: f64,
-    write_kbytes_per_sec: f64,
-}
-
-impl NetDiskMetrics {
-    fn new() -> Self {
-        Self {
-            out_packets_per_sec: 0.0,
-            out_bytes_per_sec: 0.0,
-            in_packets_per_sec: 0.0,
-            in_bytes_per_sec: 0.0,
-            read_ops_per_sec: 0.0,
-            write_ops_per_sec: 0.0,
-            read_kbytes_per_sec: 0.0,
-            write_kbytes_per_sec: 0.0,
-        }
-    }
-}
-
-#[derive(Clone)]
 struct GPUMetrics {
     freq_mhz: i32,
     active: f64,
@@ -208,6 +189,53 @@ impl MemoryMetrics {
 
     fn average_used_percent(&self) -> f64 {
         average_history(&self.used_percent_history)
+    }
+}
+
+#[derive(Clone)]
+struct NetDiskMetrics {
+    out_packets_per_sec: f64,
+    out_bytes_per_sec: f64,
+    in_packets_per_sec: f64,
+    in_bytes_per_sec: f64,
+    read_ops_per_sec: f64,
+    write_ops_per_sec: f64,
+    read_kbytes_per_sec: f64,
+    write_kbytes_per_sec: f64,
+}
+
+impl NetDiskMetrics {
+    fn new() -> Self {
+        Self {
+            out_packets_per_sec: 0.0,
+            out_bytes_per_sec: 0.0,
+            in_packets_per_sec: 0.0,
+            in_bytes_per_sec: 0.0,
+            read_ops_per_sec: 0.0,
+            write_ops_per_sec: 0.0,
+            read_kbytes_per_sec: 0.0,
+            write_kbytes_per_sec: 0.0,
+        }
+    }
+}
+
+struct ProcessInfo {
+    pid: i32,
+    name: String,
+    cpu_usage: f64,
+    memory_mb: f64,
+    total_threads: i32,
+}
+
+impl ProcessInfo {
+    fn new(pid: i32, name: String, cpu_usage: f64, memory_mb: f64, total_threads: i32) -> Self {
+        Self {
+            pid,
+            name,
+            cpu_usage,
+            memory_mb,
+            total_threads,
+        }
     }
 }
 
@@ -271,12 +299,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cpu_tx, cpu_rx) = unbounded();
     let (gpu_tx, gpu_rx) = unbounded();
     let (netdisk_tx, netdisk_rx) = unbounded();
+    let (process_tx, process_rx) = unbounded();
 
     let running = Arc::new(Mutex::new(true));
     let running_clone = Arc::clone(&running);
 
     thread::spawn(move || {
-        collect_metrics(cpu_tx, gpu_tx, netdisk_tx, running_clone);
+        collect_metrics(cpu_tx, gpu_tx, netdisk_tx, process_tx, running_clone);
     });
 
     let mut need_render = EventThrottler::new(Duration::from_millis(500));
@@ -285,6 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu_metrics = GPUMetrics::new();
     let mut netdisk_metrics = NetDiskMetrics::new();
     let mut memory_metrics = None;
+    let mut processes = Vec::new();
 
     let model_info = get_apple_silicon_info();
 
@@ -317,6 +347,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             updated = true;
         }
 
+        while let Ok(new_processes) = process_rx.try_recv() {
+            processes = new_processes;
+            updated = true;
+        }
+
         if updated || need_render.should_notify() {
             let mem_metrics = MemoryMetrics::new(&memory_metrics);
             memory_metrics = Some(mem_metrics);
@@ -329,6 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &netdisk_metrics,
                     &model_info,
                     memory_metrics.as_ref().unwrap(),
+                    &processes,
                 )
             })?;
         }
@@ -345,6 +381,158 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn get_time() -> Duration {
+    let mut ts = timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
+    }
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+fn collect_process_info() -> Vec<ProcessInfo> {
+    let mut processes = Vec::new();
+    let pids = match proc_pid::listpids(proc_pid::ProcType::ProcAllPIDS) {
+        Ok(list) => list,
+        Err(_) => return processes,
+    };
+
+    let mut process_times: Vec<(i32, Duration, TaskInfo)> = Vec::new();
+    let num_cores = num_cpus::get() as f64;
+    
+    // First sample
+    for &pid in &pids {
+        let pid_i32: i32 = match pid.try_into() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+
+        if let Ok(task_info) = pidinfo::<TaskInfo>(pid_i32, 0) {
+            process_times.push((pid_i32, get_time(), task_info));
+        }
+    }
+
+    // Wait briefly
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Second sample and calculate
+    for (pid, start_time, start_info) in process_times {
+        if let (Ok(end_info), Ok(name)) = (
+            pidinfo::<TaskInfo>(pid, 0),
+            proc_pid::name(pid)
+        ) {
+            let elapsed = get_time() - start_time;
+            
+            // Calculate CPU time delta
+            let user_delta = end_info.pti_total_user.saturating_sub(start_info.pti_total_user);
+            let system_delta = end_info.pti_total_system.saturating_sub(start_info.pti_total_system);
+            let total_delta = user_delta + system_delta;
+            
+            // Convert to percentage
+            let cpu_usage = if elapsed.as_nanos() > 0 {
+                (total_delta as f64 / elapsed.as_nanos() as f64) * 100.0 * num_cores
+            } else {
+                0.0
+            };
+
+            // Memory in MB using physical footprint
+            let memory = match pid_rusage::pidrusage::<RUsageInfoV4>(pid) {
+                Ok(usage) => usage.ri_phys_footprint as f64 / 1024.0 / 1024.0,
+                Err(_) => 0.0
+            };
+
+            // Add thread counts
+            let total_threads = end_info.pti_threadnum;
+
+            processes.push(ProcessInfo {
+                pid,
+                name,
+                cpu_usage,
+                memory_mb: memory,
+                total_threads,
+            });
+        }
+    }
+
+    // Sort by CPU usage
+    processes.sort_by(|a, b| {
+        b.cpu_usage
+            .partial_cmp(&a.cpu_usage)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    processes
+}
+
+fn collect_metrics(
+    cpu_tx: Sender<CPUMetrics>,
+    gpu_tx: Sender<GPUMetrics>,
+    netdisk_tx: Sender<NetDiskMetrics>,
+    process_tx: Sender<Vec<ProcessInfo>>,
+    running: Arc<Mutex<bool>>,
+) {
+    let mut cmd = Command::new("powermetrics")
+        .args(&[
+            "--samplers",
+            "cpu_power,gpu_power,thermal,network,disk",
+            "--show-initial-usage",
+            "-i",
+            "1000",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to start powermetrics");
+
+    let stdout = cmd.stdout.take().expect("Failed to get stdout");
+    let reader = BufReader::new(stdout);
+
+    let mut cpu_metrics = CPUMetrics::new();
+    let mut gpu_metrics = GPUMetrics::new();
+    let mut netdisk_metrics = NetDiskMetrics::new();
+
+    // Spawn process collection thread
+    let process_running = running.clone();
+    let process_tx = process_tx.clone();
+    thread::spawn(move || {
+        while *process_running.lock().unwrap() {
+            let processes = collect_process_info();
+            let _ = process_tx.send(processes);
+            thread::sleep(Duration::from_secs(2));
+        }
+    });
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        if !*running.lock().unwrap() {
+            let _ = cmd.kill();
+            break;
+        }
+
+        parse_cpu_metrics(&line, &mut cpu_metrics);
+        parse_gpu_metrics(&line, &mut gpu_metrics);
+        parse_netdisk_metrics(&line, &mut netdisk_metrics);
+
+        cpu_metrics.append_e_cluster_active(cpu_metrics.e_cluster_active);
+        cpu_metrics.append_p_cluster_active(cpu_metrics.p_cluster_active);
+        cpu_metrics.append_ane_w((cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0));
+        cpu_metrics.append_cpu_w(cpu_metrics.cpu_w);
+        cpu_metrics.append_gpu_w(cpu_metrics.gpu_w);
+        cpu_metrics.append_package_w(cpu_metrics.package_w);
+
+        gpu_metrics.append_active(gpu_metrics.active);
+
+        let _ = cpu_tx.send(cpu_metrics.clone());
+        let _ = gpu_tx.send(gpu_metrics.clone());
+        let _ = netdisk_tx.send(netdisk_metrics.clone());
+    }
+}
+
 fn draw_ui(
     f: &mut Frame<CrosstermBackend<std::io::Stdout>>,
     cpu_metrics: &CPUMetrics,
@@ -352,62 +540,50 @@ fn draw_ui(
     netdisk_metrics: &NetDiskMetrics,
     model_info: &AppleSiliconInfo,
     memory_metrics: &MemoryMetrics,
+    processes: &[ProcessInfo],
 ) {
     let size = f.size();
 
-    // Split the screen vertically into top and bottom halves
     let vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(50), // Top Half
-                Constraint::Percentage(50), // Bottom Half
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage(40),  // Usage
+            Constraint::Percentage(30),  // Memory/Power
+            Constraint::Percentage(30),  // Process List
+        ])
         .split(size);
 
-    // --- Top Half (CPU/GPU/ANE Utilization + Power) ---
+    // --- Top Half (CPU/GPU/ANE) ---
     let top_columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(50), // Left Column (CPU)
-                Constraint::Percentage(50), // Right Column (GPU & ANE)
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
         .split(vertical_chunks[0]);
 
-    // Left Column: CPU Utilization and CPU Power
+    // Left Column: CPU  
     let left_split = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(80), // CPU Utilization
-                Constraint::Percentage(20), // CPU Power
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage(80),
+        ])
         .split(top_columns[0]);
 
     // CPU Utilization (E-CPU and P-CPU)
     let cpu_utilization_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(50), // E-CPU
-                Constraint::Percentage(50), // P-CPU
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
         .split(left_split[0]);
 
     let e_cpu_avg = cpu_metrics.average_e_cluster_active();
     render_utilization_chart(
         f,
         cpu_utilization_chunks[0],
-        "\n E-CPU Usage",
+        "\n E-CPU Usage: ",
         &format!(
             "{}% @ {}MHz\n \n \n Avg: {:.1}% \n",
             cpu_metrics.e_cluster_active, cpu_metrics.e_cluster_freq_mhz, e_cpu_avg
@@ -420,7 +596,7 @@ fn draw_ui(
     render_utilization_chart(
         f,
         cpu_utilization_chunks[1],
-        "\n P-CPU Usage",
+        "\n P-CPU Usage: ",
         &format!(
             "{}% @ {}MHz\n \n \n Avg: {:.1}% \n",
             cpu_metrics.p_cluster_active, cpu_metrics.p_cluster_freq_mhz, p_cpu_avg
@@ -429,38 +605,21 @@ fn draw_ui(
         Color::Yellow,
     );
 
-    // CPU Power
-    render_power_chart(
-        f,
-        left_split[1],
-        "\n CPU Power",
-        &format!("{:.2} W \n", cpu_metrics.cpu_w),
-        &cpu_metrics.cpu_w_history,
-        Color::Red,
-    );
-
-    // Right Column: GPU & ANE Utilization and GPU Power
+    // Right Column: GPU & ANE
     let right_split = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(80), // GPU & ANE Utilization
-                Constraint::Percentage(20), // GPU Power
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage(80),
+        ])
         .split(top_columns[1]);
 
-    // GPU & ANE Utilization
+    // GPU & ANE
     let gpu_ane_utilization_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(50), // GPU
-                Constraint::Percentage(50), // ANE
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
         .split(right_split[0]);
 
     let ane_util = (cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0);
@@ -468,7 +627,7 @@ fn draw_ui(
     render_utilization_chart(
         f,
         gpu_ane_utilization_chunks[0],
-        "\n ANE Usage",
+        "\n ANE Usage: ",
         &format!(
             "{:.0}% @ {:.2}W\n \n \n Avg: {:.1}% \n",
             ane_util, cpu_metrics.ane_w, ane_avg
@@ -481,118 +640,117 @@ fn draw_ui(
     render_utilization_chart(
         f,
         gpu_ane_utilization_chunks[1],
-        "\n GPU Usage",
+        "\n GPU Usage: ",
         &format!(
             "{:.0}% @ {}MHz\n \n \n Avg: {:.1}% \n",
             gpu_metrics.active, gpu_metrics.freq_mhz, gpu_avg
         ),
         &gpu_metrics.active_history,
-        Color::Magenta,
-    );
-    // GPU Power
-    render_power_chart(
-        f,
-        right_split[1],
-        "\n GPU Power",
-        &format!("{:.2} W \n", cpu_metrics.gpu_w),
-        &cpu_metrics.gpu_w_history,
-        Color::Red,
+        Color::Rgb(146, 38, 253),
     );
 
-    // --- Bottom Half ---
-    let bottom_split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Percentage(50), // Memory Usage
-                Constraint::Percentage(50), // Apple Silicon Info, Network & Disk Info, Package Power
-            ]
-            .as_ref(),
-        )
-        .split(vertical_chunks[1]);
+    let middle_columns = Layout::default()
+    .direction(Direction::Horizontal)
+    .constraints([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .split(vertical_chunks[1]);
 
-    // Memory Usage spanning the top half of the bottom half
+    // Memory Usage
     let mem_avg = memory_metrics.average_used_percent();
     render_utilization_chart(
-        f,
-        bottom_split[0],
-        "\n Memory Usage",
-        &format!(
-            "{:.1}%\n \n \n {:.2} GB / {:.2} GB\n \n \n Swap Used: {:.2} GB / {:.2} GB\n \n \n Avg: {:.1}% \n",
-            memory_metrics.used_percent,
-            (memory_metrics.used) as f64 / 1024.0 / 1024.0 / 1024.0,
-            (memory_metrics.total) as f64 / 1024.0 / 1024.0 / 1024.0,
-            (memory_metrics.swap_used) as f64 / 1024.0 / 1024.0 / 1024.0,
-            (memory_metrics.swap_total) as f64 / 1024.0 / 1024.0 / 1024.0,
-            mem_avg,
-        ),
-        &memory_metrics.used_percent_history,
-        Color::Cyan,
+    f,
+    middle_columns[0],
+    "\n Memory Usage: ",
+    &format!(
+        "{:.1}%\n \n \n {:.2} GB / {:.2} GB\n \n \n Swap Used: {:.2} GB / {:.2} GB\n \n \n Avg: {:.1}% \n",
+        memory_metrics.used_percent,
+        (memory_metrics.used) as f64 / 1024.0 / 1024.0 / 1024.0,
+        (memory_metrics.total) as f64 / 1024.0 / 1024.0 / 1024.0,
+        (memory_metrics.swap_used) as f64 / 1024.0 / 1024.0 / 1024.0,
+        (memory_metrics.swap_total) as f64 / 1024.0 / 1024.0 / 1024.0,
+        mem_avg,
+    ),
+    &memory_metrics.used_percent_history,
+    Color::Cyan,
     );
 
-    // Bottom part of the bottom half: Apple Silicon Info, Network & Disk Info, Package Power
-    let lower_bottom_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-            ]
-            .as_ref(),
-        )
-        .split(bottom_split[1]);
-
-    // Apple Silicon Info
-    let model_text = format!(
-        "Model: {}\nE-Cores: {}\nP-Cores: {}\nGPU Cores: {}",
-        model_info.name,
-        model_info.e_core_count,
-        model_info.p_core_count,
-        model_info.gpu_core_count,
-    );
-    let model_paragraph = Paragraph::new(model_text)
-        .block(
-            Block::default()
-                .title("\n Apple Silicon Info \n")
-                .borders(tui::widgets::Borders::ALL),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(model_paragraph, lower_bottom_chunks[0]);
-
-    // Network & Disk Info
-    let netdisk_text = format!(
-        "Out: {:.1} packets/s, {:.1} bytes/s\n\
-        In: {:.1} packets/s, {:.1} bytes/s\n\
-        Read: {:.1} ops/s, {:.1} KB/s\n\
-        Write: {:.1} ops/s, {:.1} KB/s",
-        netdisk_metrics.out_packets_per_sec,
-        netdisk_metrics.out_bytes_per_sec,
-        netdisk_metrics.in_packets_per_sec,
-        netdisk_metrics.in_bytes_per_sec,
-        netdisk_metrics.read_ops_per_sec,
-        netdisk_metrics.read_kbytes_per_sec,
-        netdisk_metrics.write_ops_per_sec,
-        netdisk_metrics.write_kbytes_per_sec,
-    );
-    let netdisk_paragraph = Paragraph::new(netdisk_text)
-        .block(
-            Block::default()
-                .title("\n Network & Disk Info \n")
-                .borders(tui::widgets::Borders::ALL),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(netdisk_paragraph, lower_bottom_chunks[1]);
+    // Power Charts 
+    let power_chunks = Layout::default()
+    .direction(Direction::Horizontal)
+    .constraints([
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
+        Constraint::Percentage(34),
+    ])
+    .split(middle_columns[1]);
 
     // Package Power
+    let package_avg = cpu_metrics.average_package_w();
     render_power_chart(
-        f,
-        lower_bottom_chunks[2],
-        "\n Package Power",
-        &format!("{:.2} W \n", cpu_metrics.package_w),
-        &cpu_metrics.package_w_history,
-        Color::Red,
+    f,
+    power_chunks[0],
+    "\n Package Power: ",
+    &format!("{:.2}W\n \n \n \n", cpu_metrics.package_w),
+    &cpu_metrics.package_w_history,
+    Color::Red,
     );
+
+    // CPU Power
+    let cpu_avg = cpu_metrics.average_cpu_w();
+    render_power_chart(
+    f,
+    power_chunks[1],
+    "\n CPU Power: ",
+    &format!("{:.2}W\n \n \n \n", cpu_metrics.cpu_w),
+    &cpu_metrics.cpu_w_history,
+    Color::Red,
+    );
+
+    // GPU Power
+    let gpu_avg = cpu_metrics.average_gpu_w();
+    render_power_chart(
+    f,
+    power_chunks[2],
+    "\n GPU Power: ",
+    &format!("{:.2}W\n \n \n \n", cpu_metrics.gpu_w),
+    &cpu_metrics.gpu_w_history,
+    Color::Red,
+    );
+
+    // Process List Section
+    let process_rows: Vec<Row> = processes
+        .iter()
+        .map(|p| {
+            Row::new(vec![
+                format!("{}", p.pid),
+                p.name.clone(),
+                format!("{:.1}%", p.cpu_usage),
+                format!("{:.1} MB", p.memory_mb),
+                format!("{}", p.total_threads), 
+            ])
+        })
+        .collect();
+
+        let process_table = Table::new(process_rows)
+        .header(Row::new(vec![
+            "PID",
+            "Name", 
+            "CPU%",
+            "Memory",
+            "Threads",  
+        ]).style(Style::default().add_modifier(Modifier::BOLD)))
+        .block(Block::default().title("\n Process List \n").borders(tui::widgets::Borders::ALL))
+        .widths(&[
+            Constraint::Percentage(10),
+            Constraint::Percentage(40),    
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Percentage(20),   
+        ]);
+
+    f.render_widget(process_table, vertical_chunks[2]);
 }
 
 fn render_utilization_chart<T>(
@@ -620,7 +778,7 @@ fn render_utilization_chart<T>(
     let canvas = Canvas::default()
         .block(
             Block::default()
-                .title(format!("{}: {}", title, label))
+                .title(format!("{}{}", title, label))
                 .borders(tui::widgets::Borders::ALL),
         )
         .x_bounds(x_bounds)
@@ -661,7 +819,6 @@ fn render_power_chart(
     color: Color,
 ) {
     let now = Instant::now();
-    // Find the peak in the last 120 seconds
     let peak = history
         .iter()
         .filter(|(time, _)| *time >= now - Duration::from_secs(120))
@@ -670,7 +827,6 @@ fn render_power_chart(
     if peak == 0.0 {
         return;
     }
-    // Collect data as proportion of peak
     let data: Vec<(f64, f64)> = history
         .iter()
         .map(|(time, value)| {
@@ -685,7 +841,7 @@ fn render_power_chart(
     let canvas = Canvas::default()
         .block(
             Block::default()
-                .title(format!("{}: {}", title, label))
+                .title(format!("{}{}", title, label))
                 .borders(tui::widgets::Borders::ALL),
         )
         .x_bounds(x_bounds)
@@ -737,63 +893,6 @@ where
     }
     let sum: f64 = history.iter().map(|&(_, value)| value.into()).sum();
     sum / (history.len() as f64)
-}
-
-fn collect_metrics(
-    cpu_tx: Sender<CPUMetrics>,
-    gpu_tx: Sender<GPUMetrics>,
-    netdisk_tx: Sender<NetDiskMetrics>,
-    running: Arc<Mutex<bool>>,
-) {
-    let mut cmd = Command::new("powermetrics")
-        .args(&[
-            "--samplers",
-            "cpu_power,gpu_power,thermal,network,disk",
-            "--show-initial-usage",
-            "-i",
-            "1000",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to start powermetrics");
-
-    let stdout = cmd.stdout.take().expect("Failed to get stdout");
-    let reader = BufReader::new(stdout);
-
-    let mut cpu_metrics = CPUMetrics::new();
-    let mut gpu_metrics = GPUMetrics::new();
-    let mut netdisk_metrics = NetDiskMetrics::new();
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        if !*running.lock().unwrap() {
-            let _ = cmd.kill();
-            break;
-        }
-
-        parse_cpu_metrics(&line, &mut cpu_metrics);
-        parse_gpu_metrics(&line, &mut gpu_metrics);
-        parse_netdisk_metrics(&line, &mut netdisk_metrics);
-
-        // Append to histories
-        cpu_metrics.append_e_cluster_active(cpu_metrics.e_cluster_active);
-        cpu_metrics.append_p_cluster_active(cpu_metrics.p_cluster_active);
-        cpu_metrics.append_ane_w((cpu_metrics.ane_w * 100.0 / 8.0).clamp(0.0, 100.0));
-
-        cpu_metrics.append_cpu_w(cpu_metrics.cpu_w);
-        cpu_metrics.append_gpu_w(cpu_metrics.gpu_w);
-        cpu_metrics.append_package_w(cpu_metrics.package_w);
-
-        gpu_metrics.append_active(gpu_metrics.active);
-
-        let _ = cpu_tx.send(cpu_metrics.clone());
-        let _ = gpu_tx.send(gpu_metrics.clone());
-        let _ = netdisk_tx.send(netdisk_metrics.clone());
-    }
 }
 
 fn parse_cpu_metrics(line: &str, cpu_metrics: &mut CPUMetrics) {
@@ -957,8 +1056,6 @@ fn get_swap_memory() -> Result<(u64, u64, u64), std::io::Error> {
             let used = parse_size(&caps[3], &caps[4]);
             let free = parse_size(&caps[5], &caps[6]);
             return Ok((total, used, free));
-        } else {
-            eprintln!("Failed to parse swap usage: {}", output_str);
         }
     }
     Err(std::io::Error::new(
