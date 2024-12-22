@@ -316,16 +316,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut memory_metrics = None;
     let mut processes = Vec::new();
 
+    let mut scroll_state = ScrollState::new();
+
     let model_info = get_apple_silicon_info();
 
     // Main Event Loop
     loop {
         if crossterm::event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
-                    let mut running = running.lock().unwrap();
-                    *running = false;
-                    break;
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        let mut running = running.lock().unwrap();
+                        *running = false;
+                        break;
+                    }
+                    KeyCode::Up => {
+                        scroll_state.scroll_up();
+                        // Force immediate redraw
+                        terminal.draw(|f| {
+                            draw_ui(
+                                f,
+                                &cpu_metrics,
+                                &gpu_metrics,
+                                &netdisk_metrics,
+                                &model_info,
+                                memory_metrics.as_ref().unwrap(),
+                                &processes,
+                                &scroll_state,
+                            )
+                        })?;
+                    }
+                    KeyCode::Down => {
+                        let process_area_height = terminal.size()?.height as usize;
+                        scroll_state.scroll_down(processes.len(), process_area_height.saturating_sub(3));
+                        // Force immediate redraw
+                        terminal.draw(|f| {
+                            draw_ui(
+                                f,
+                                &cpu_metrics,
+                                &gpu_metrics,
+                                &netdisk_metrics,
+                                &model_info,
+                                memory_metrics.as_ref().unwrap(),
+                                &processes,
+                                &scroll_state,
+                            )
+                        })?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -365,6 +403,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &model_info,
                     memory_metrics.as_ref().unwrap(),
                     &processes,
+                    &scroll_state,
                 )
             })?;
         }
@@ -541,6 +580,7 @@ fn draw_ui(
     model_info: &AppleSiliconInfo,
     memory_metrics: &MemoryMetrics,
     processes: &[ProcessInfo],
+    scroll_state: &ScrollState,  
 ) {
     let size = f.size();
 
@@ -719,8 +759,14 @@ fn draw_ui(
     Color::Red,
     );
 
+    let process_area_height = (vertical_chunks[2].height as usize).saturating_sub(3); 
+    let visible_processes = &processes[scroll_state.offset..] 
+        .iter()
+        .take(process_area_height) 
+        .collect::<Vec<_>>();
+
     // Process List Section
-    let process_rows: Vec<Row> = processes
+    let process_rows: Vec<Row> = visible_processes
         .iter()
         .map(|p| {
             Row::new(vec![
@@ -736,18 +782,23 @@ fn draw_ui(
         let process_table = Table::new(process_rows)
         .header(Row::new(vec![
             "PID",
-            "Name", 
+            "Name",
             "CPU%",
             "Memory",
-            "Threads",  
+            "Threads",
         ]).style(Style::default().add_modifier(Modifier::BOLD)))
-        .block(Block::default().title("\n Process List \n").borders(tui::widgets::Borders::ALL))
+        .block(Block::default()
+        .title(format!("\n Process List ({}/{}) {} ↑/↓ to scroll \n", 
+        scroll_state.offset + 1, 
+        processes.len(),
+        "─".repeat((vertical_chunks[2].width as usize) - 40)))
+        .borders(tui::widgets::Borders::ALL))
         .widths(&[
             Constraint::Percentage(10),
-            Constraint::Percentage(40),    
+            Constraint::Percentage(40),
             Constraint::Percentage(15),
             Constraint::Percentage(15),
-            Constraint::Percentage(20),   
+            Constraint::Percentage(20),
         ]);
 
     f.render_widget(process_table, vertical_chunks[2]);
@@ -772,7 +823,7 @@ fn render_utilization_chart<T>(
         })
         .collect();
 
-    let x_bounds = [-120.0, 0.0];
+    let x_bounds = [-60.0, 0.0];
     let y_bounds = [0.0, 100.0];
 
     let canvas = Canvas::default()
@@ -835,7 +886,7 @@ fn render_power_chart(
         })
         .collect();
 
-    let x_bounds = [-120.0, 0.0];
+    let x_bounds = [-60.0, 0.0];
     let y_bounds = [0.0, 100.0];
 
     let canvas = Canvas::default()
@@ -1115,6 +1166,28 @@ fn get_apple_silicon_info() -> AppleSiliconInfo {
         e_core_count,
         p_core_count,
         gpu_core_count,
+    }
+}
+
+struct ScrollState {
+    offset: usize,
+}
+
+impl ScrollState {
+    fn new() -> Self {
+        Self { offset: 0 }
+    }
+
+    fn scroll_up(&mut self) {
+        if self.offset > 0 {
+            self.offset -= 1;
+        }
+    }
+
+    fn scroll_down(&mut self, list_length: usize, visible_items: usize) {
+        if self.offset + visible_items < list_length {
+            self.offset += 1;
+        }
     }
 }
 
