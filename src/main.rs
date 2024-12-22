@@ -26,7 +26,7 @@ use tui::backend::CrosstermBackend;
 use tui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Modifier},
-    widgets::{Block, Paragraph, Wrap, Table, Row},
+    widgets::{Block, Paragraph, Wrap, Table, Row, Cell},
     widgets::canvas::{Canvas, Line},
     Frame, Terminal,
 };
@@ -317,6 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut processes = Vec::new();
 
     let mut scroll_state = ScrollState::new();
+    let mut table_state = TableState::new();
 
     let model_info = get_apple_silicon_info();
 
@@ -343,6 +344,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 memory_metrics.as_ref().unwrap(),
                                 &processes,
                                 &scroll_state,
+                                &table_state,
                             )
                         })?;
                     }
@@ -360,6 +362,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 memory_metrics.as_ref().unwrap(),
                                 &processes,
                                 &scroll_state,
+                                &table_state,
+                            )
+                        })?;
+                    }
+                    KeyCode::Left => {
+                        table_state.previous_column();
+                        terminal.draw(|f| {
+                            draw_ui(
+                                f,
+                                &cpu_metrics,
+                                &gpu_metrics,
+                                &netdisk_metrics,
+                                &model_info,
+                                memory_metrics.as_ref().unwrap(),
+                                &processes,
+                                &scroll_state,
+                                &table_state,
+                            )
+                        })?;
+                    }
+                    KeyCode::Right => {
+                        table_state.next_column();
+                        terminal.draw(|f| {
+                            draw_ui(
+                                f,
+                                &cpu_metrics,
+                                &gpu_metrics,
+                                &netdisk_metrics,
+                                &model_info,
+                                memory_metrics.as_ref().unwrap(),
+                                &processes,
+                                &scroll_state,
+                                &table_state,
+                            )
+                        })?;
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        table_state.sort_column = Some(table_state.selected_column);
+                        sort_processes(&mut processes, table_state.selected_column);
+                        terminal.draw(|f| {
+                            draw_ui(
+                                f,
+                                &cpu_metrics,
+                                &gpu_metrics,
+                                &netdisk_metrics,
+                                &model_info,
+                                memory_metrics.as_ref().unwrap(),
+                                &processes,
+                                &scroll_state,
+                                &table_state,
                             )
                         })?;
                     }
@@ -385,7 +437,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             updated = true;
         }
 
-        while let Ok(new_processes) = process_rx.try_recv() {
+        while let Ok(mut new_processes) = process_rx.try_recv() {
+            match table_state.sort_column {
+                Some(sort_col) => {
+                    // Sort by explicitly selected sort column
+                    sort_processes(&mut new_processes, sort_col);
+                }
+                None => {
+                    // Default sort by CPU usage
+                    sort_processes(&mut new_processes, Column::CpuUsage);
+                }
+            }
             processes = new_processes;
             updated = true;
         }
@@ -404,6 +466,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     memory_metrics.as_ref().unwrap(),
                     &processes,
                     &scroll_state,
+                    &table_state,
                 )
             })?;
         }
@@ -495,13 +558,6 @@ fn collect_process_info() -> Vec<ProcessInfo> {
         }
     }
 
-    // Sort by CPU usage
-    processes.sort_by(|a, b| {
-        b.cpu_usage
-            .partial_cmp(&a.cpu_usage)
-            .unwrap_or(Ordering::Equal)
-    });
-
     processes
 }
 
@@ -581,6 +637,7 @@ fn draw_ui(
     memory_metrics: &MemoryMetrics,
     processes: &[ProcessInfo],
     scroll_state: &ScrollState,  
+    table_state: &TableState,
 ) {
     let size = f.size();
 
@@ -765,6 +822,23 @@ fn draw_ui(
         .take(process_area_height) 
         .collect::<Vec<_>>();
 
+        let header_cells = vec![
+            ("PID", Column::Pid),
+            ("Name", Column::Name),
+            ("CPU%", Column::CpuUsage),
+            ("Memory", Column::Memory),
+            ("Threads", Column::Threads),
+        ]
+        .into_iter()
+        .map(|(text, col)| {
+            if col == table_state.selected_column {
+                Cell::from(format!(">{}<", text)).style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
+            } else {
+                Cell::from(text).style(Style::default().add_modifier(Modifier::BOLD))
+            }
+        })
+        .collect::<Vec<_>>();
+
     // Process List Section
     let process_rows: Vec<Row> = visible_processes
         .iter()
@@ -780,18 +854,12 @@ fn draw_ui(
         .collect();
 
         let process_table = Table::new(process_rows)
-        .header(Row::new(vec![
-            "PID",
-            "Name",
-            "CPU%",
-            "Memory",
-            "Threads",
-        ]).style(Style::default().add_modifier(Modifier::BOLD)))
+        .header(Row::new(header_cells))
         .block(Block::default()
-        .title(format!("\n Process List ({}/{}) {} ↑/↓ to scroll \n", 
-        scroll_state.offset + 1, 
-        processes.len(),
-        "─".repeat((vertical_chunks[2].width as usize) - 40)))
+            .title(format!("\n Process List ({}/{}) {}↑/↓ to scroll, ←/→ select column, 's' to sort\n", 
+                scroll_state.offset + 1, 
+                processes.len(),
+                " ".repeat((vertical_chunks[2].width as usize).saturating_sub(69))))
         .borders(tui::widgets::Borders::ALL))
         .widths(&[
             Constraint::Percentage(10),
@@ -1188,6 +1256,94 @@ impl ScrollState {
         if self.offset + visible_items < list_length {
             self.offset += 1;
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Column {
+    Pid,
+    Name,
+    CpuUsage,
+    Memory,
+    Threads,
+}
+
+impl Column {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Column::Pid => "PID",
+            Column::Name => "Name",
+            Column::CpuUsage => "CPU%",
+            Column::Memory => "Memory",
+            Column::Threads => "Threads",
+        }
+    }
+
+    fn next(&self) -> Self {
+        match self {
+            Column::Pid => Column::Name,
+            Column::Name => Column::CpuUsage,
+            Column::CpuUsage => Column::Memory,
+            Column::Memory => Column::Threads,
+            Column::Threads => Column::Pid,
+        }
+    }
+
+    fn previous(&self) -> Self {
+        match self {
+            Column::Pid => Column::Threads,
+            Column::Name => Column::Pid,
+            Column::CpuUsage => Column::Name,
+            Column::Memory => Column::CpuUsage,
+            Column::Threads => Column::Memory,
+        }
+    }
+}
+
+struct TableState {
+    scroll_offset: usize,
+    selected_column: Column,
+    sort_column: Option<Column>, 
+}
+
+impl TableState {
+    fn new() -> Self {
+        Self {
+            scroll_offset: 0,
+            selected_column: Column::Pid,
+            sort_column: None,
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        }
+    }
+
+    fn scroll_down(&mut self, list_length: usize, visible_items: usize) {
+        let max_scroll = list_length.saturating_sub(visible_items);
+        if self.scroll_offset < max_scroll {
+            self.scroll_offset += 1;
+        }
+    }
+
+    fn next_column(&mut self) {
+        self.selected_column = self.selected_column.next();
+    }
+
+    fn previous_column(&mut self) {
+        self.selected_column = self.selected_column.previous();
+    }
+}
+
+fn sort_processes(processes: &mut Vec<ProcessInfo>, column: Column) {
+    match column {
+        Column::Pid => processes.sort_by_key(|p| p.pid),
+        Column::Name => processes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        Column::CpuUsage => processes.sort_by(|a, b| b.cpu_usage.partial_cmp(&a.cpu_usage).unwrap_or(std::cmp::Ordering::Equal)),
+        Column::Memory => processes.sort_by(|a, b| b.memory_mb.partial_cmp(&a.memory_mb).unwrap_or(std::cmp::Ordering::Equal)),
+        Column::Threads => processes.sort_by_key(|p| -p.total_threads), // Negative for descending order
     }
 }
 
