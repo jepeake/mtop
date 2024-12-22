@@ -11,8 +11,12 @@ use std::convert::TryInto;
 use libproc::libproc::pid_rusage::{self, RUsageInfoV4};
 use libproc::libproc::proc_pid::{self, pidinfo};
 use libproc::libproc::task_info::TaskInfo;
+use libproc::libproc::bsd_info::BSDInfo;
 
 use libc::{c_void, clock_gettime, timespec, CLOCK_MONOTONIC};
+
+use std::ffi::CStr;
+use libc::{uid_t, passwd, getpwuid};
 
 use crossbeam_channel::{unbounded, Sender};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
@@ -225,18 +229,33 @@ struct ProcessInfo {
     cpu_usage: f64,
     memory_mb: f64,
     total_threads: i32,
+    user: String,
 }
 
 impl ProcessInfo {
-    fn new(pid: i32, name: String, cpu_usage: f64, memory_mb: f64, total_threads: i32) -> Self {
+    fn new(pid: i32, name: String, cpu_usage: f64, memory_mb: f64, total_threads: i32, user: String) -> Self {
         Self {
             pid,
+            user,
             name,
             cpu_usage,
             memory_mb,
             total_threads,
         }
     }
+}
+
+fn get_username(uid: uid_t) -> String {
+    unsafe {
+        let passwd = getpwuid(uid);
+        if !passwd.is_null() {
+            let name = CStr::from_ptr((*passwd).pw_name)
+                .to_string_lossy()
+                .into_owned();
+            return name;
+        }
+    }
+    uid.to_string() 
 }
 
 struct EventThrottler {
@@ -521,10 +540,20 @@ fn collect_process_info() -> Vec<ProcessInfo> {
 
     // Second sample and calculate
     for (pid, start_time, start_info) in process_times {
-        if let (Ok(end_info), Ok(name)) = (
+        if let (Ok(end_info), Ok(name), Ok(task_info), Ok(rusage)) = (
             pidinfo::<TaskInfo>(pid, 0),
-            proc_pid::name(pid)
+            proc_pid::name(pid),
+            pidinfo::<TaskInfo>(pid, 0),
+            pid_rusage::pidrusage::<RUsageInfoV4>(pid)
         ) {
+            let uid = if let Ok(bsd_info) = pidinfo::<BSDInfo>(pid, 0) {
+                bsd_info.pbi_uid
+            } else {
+                0
+            };
+            
+            let username = get_username(uid);
+
             let elapsed = get_time() - start_time;
             
             // Calculate CPU time delta
@@ -554,6 +583,7 @@ fn collect_process_info() -> Vec<ProcessInfo> {
                 cpu_usage,
                 memory_mb: memory,
                 total_threads,
+                user: username,
             });
         }
     }
@@ -825,14 +855,15 @@ fn draw_ui(
         let header_cells = vec![
             ("PID", Column::Pid),
             ("Name", Column::Name),
-            ("CPU%", Column::CpuUsage),
+            ("CPU", Column::CpuUsage),
             ("Memory", Column::Memory),
             ("Threads", Column::Threads),
+            ("User", Column::User),
         ]
         .into_iter()
         .map(|(text, col)| {
             if col == table_state.selected_column {
-                Cell::from(format!(">{}<", text)).style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
+                Cell::from(format!("{}", text)).style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
             } else {
                 Cell::from(text).style(Style::default().add_modifier(Modifier::BOLD))
             }
@@ -849,6 +880,7 @@ fn draw_ui(
                 format!("{:.1}%", p.cpu_usage),
                 format!("{:.1} MB", p.memory_mb),
                 format!("{}", p.total_threads), 
+                p.user.clone(),
             ])
         })
         .collect();
@@ -863,10 +895,11 @@ fn draw_ui(
         .borders(tui::widgets::Borders::ALL))
         .widths(&[
             Constraint::Percentage(10),
-            Constraint::Percentage(40),
+            Constraint::Percentage(30),
             Constraint::Percentage(15),
             Constraint::Percentage(15),
             Constraint::Percentage(20),
+            Constraint::Percentage(10), 
         ]);
 
     f.render_widget(process_table, vertical_chunks[2]);
@@ -1262,6 +1295,7 @@ impl ScrollState {
 #[derive(Clone, Copy, PartialEq)]
 enum Column {
     Pid,
+    User,
     Name,
     CpuUsage,
     Memory,
@@ -1276,6 +1310,7 @@ impl Column {
             Column::CpuUsage => "CPU%",
             Column::Memory => "Memory",
             Column::Threads => "Threads",
+            Column::User => "User",
         }
     }
 
@@ -1285,17 +1320,19 @@ impl Column {
             Column::Name => Column::CpuUsage,
             Column::CpuUsage => Column::Memory,
             Column::Memory => Column::Threads,
-            Column::Threads => Column::Pid,
+            Column::Threads => Column::User,
+            Column::User => Column::Pid,
         }
     }
 
     fn previous(&self) -> Self {
         match self {
-            Column::Pid => Column::Threads,
+            Column::Pid => Column::User,
             Column::Name => Column::Pid,
             Column::CpuUsage => Column::Name,
             Column::Memory => Column::CpuUsage,
             Column::Threads => Column::Memory,
+            Column::User => Column::Threads,
         }
     }
 }
@@ -1340,6 +1377,7 @@ impl TableState {
 fn sort_processes(processes: &mut Vec<ProcessInfo>, column: Column) {
     match column {
         Column::Pid => processes.sort_by_key(|p| p.pid),
+        Column::User => processes.sort_by(|a, b| a.user.cmp(&b.user)),
         Column::Name => processes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         Column::CpuUsage => processes.sort_by(|a, b| b.cpu_usage.partial_cmp(&a.cpu_usage).unwrap_or(std::cmp::Ordering::Equal)),
         Column::Memory => processes.sort_by(|a, b| b.memory_mb.partial_cmp(&a.memory_mb).unwrap_or(std::cmp::Ordering::Equal)),
