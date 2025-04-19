@@ -26,22 +26,6 @@ Run:
 
 `sudo mtop`
 
-## Contributions
-
-Any contributions to this open-source project are greatly appreciated.
-
-The issues section is a good place to start for things to contribute.
-
-To contribute:
-
-- Fork mtop.
-- Create a branch for your feature - i.e. `feature/power-util`
-- Implement the features & commit your changes.
-- Push to the branch: `git push origin feature/power-util`
-- Open a Pull Request to mtop.
-
-Thank you!
-
 ## Acknowledgements
 
 - [asitop](https://github.com/tlkh/asitop) / [mactop](https://github.com/context-labs/mactop) / [nvitop](https://github.com/XuehaiPan/nvitop) for inspiration
