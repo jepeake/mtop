@@ -6,16 +6,6 @@
 
 ![image](https://github.com/user-attachments/assets/b3dfbcf2-c43e-4cac-adf9-90fea1113fcd)
 
-## Features
-
-- CPU (P-Cores & E-Core), GPU, ANE, & Memory Utilisation
-- Package, CPU, & GPU Power Monitoring
-- Procss Monitoring
-- Network & Disk Information
-- Apple Silicon Info
-- Clean UI
-- Fast & Performant
-  
 ## Installation
 
 Install using [Homebrew](https://brew.sh):
