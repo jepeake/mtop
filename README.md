@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-%23000000.svg?e&logo=rust&logoColor=white)](#) &ensp; ![GitHub Release](https://img.shields.io/github/v/release/jepeake/mtop)
 
-_**mtop** is a rust-based terminal performance monitor for apple silicon_
+_**mtop** is a terminal-based performance monitor for apple silicon_
 
 ![image](https://github.com/user-attachments/assets/b3dfbcf2-c43e-4cac-adf9-90fea1113fcd)
 
